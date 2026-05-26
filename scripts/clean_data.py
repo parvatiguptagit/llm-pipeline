@@ -38,7 +38,7 @@ def main():
     with open(OUTPUT, "w") as f:
         json.dump(cleaned, f, indent=2)
 
-    print(f"✅ Enhanced dataset: {len(cleaned)} samples")
+    print(f"Enhanced dataset: {len(cleaned)} samples")
 
 if __name__ == "__main__":
     main()

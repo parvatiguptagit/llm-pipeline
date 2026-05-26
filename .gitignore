@@ -1,13 +1,31 @@
-venv/
-.venv/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Virtual Env
+.venv/
+
+# DVC cache
+.dvc/cache/
+
+# Models
+models/
+
+# Data
+data/raw/
+data/processed/
+
+# Label Studio exports
+exports/
+
+# Environment variables
 .env
-data/
-.dvc/
-auto.json
-train.json
-final_train.json
-labelstudio_export.json
-project_id.txt
+
+# VSCode
 .vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

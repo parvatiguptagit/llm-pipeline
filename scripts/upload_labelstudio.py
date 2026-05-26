@@ -1,146 +1,95 @@
 import json
-import requests
 import os
+import sys
+from pathlib import Path
 
-USERNAME = os.getenv("LABEL_STUDIO_EMAIL")
-PASSWORD = os.getenv("LABEL_STUDIO_PASSWORD")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from label_studio_client import (
+    BASE_URL,
+    api_headers,
+    delete_project,
+    ensure_project,
+    load_project_id,
+    login_session,
+    parse_results,
+    save_project_id,
+)
+from nomic_utils import pair_key
 
 INPUT = "data/processed/cleaned.json"
-BASE_URL = "http://localhost:8080"
-
-PROJECT_FILE = "project_id.txt"
-
-
-# 🔥 Load previous project id
-def load_project_id():
-    if os.path.exists(PROJECT_FILE):
-        with open(PROJECT_FILE, "r") as f:
-            return f.read().strip()
-    return None
+MAX_SAMPLES = int(os.getenv("MAX_UPLOAD_SAMPLES", "500"))
+RECREATE = os.getenv("RECREATE_LABEL_PROJECT", "0") == "1"
+IMPORT_BATCH = int(os.getenv("LS_IMPORT_BATCH", "100"))
 
 
-# 🔥 Save project id
-def save_project_id(pid):
-    with open(PROJECT_FILE, "w") as f:
-        f.write(str(pid))
-
-
-# 🔥 DELETE + CREATE PROJECT
-def recreate_project(session, csrftoken):
-    project_id = load_project_id()
-
-    # 🧨 DELETE OLD PROJECT (if exists)
-    if project_id:
-        print(f"🧨 Deleting old project: {project_id}")
-
-        delete_url = f"{BASE_URL}/api/projects/{project_id}"
-        headers = {"X-CSRFToken": csrftoken}
-
-        res = session.delete(delete_url, headers=headers)
-        print("DELETE STATUS:", res.status_code)
-
-    # 🆕 CREATE NEW PROJECT
-    print("🆕 Creating new project...")
-
-    create_url = f"{BASE_URL}/api/projects"
-
-    payload = {
-        "title": "AutoGPT Fresh Dataset",
-        "label_config": """
-        <View>
-          <Text name="query" value="$query"/>
-          <Text name="code" value="$code"/>
-          <Choices name="label" toName="code">
-            <Choice value="Relevant"/>
-            <Choice value="Not Relevant"/>
-          </Choices>
-        </View>
-        """
-    }
-
-    headers = {
-        "X-CSRFToken": csrftoken,
-        "Content-Type": "application/json"
-    }
-
-    res = session.post(create_url, json=payload, headers=headers)
-
-    project = res.json()
-    new_project_id = project["id"]
-
-    print("✅ New Project ID:", new_project_id)
-
-    # 💾 SAVE for next run
-    save_project_id(new_project_id)
-
-    return new_project_id
+def existing_task_keys(session, csrftoken, project_id):
+    headers = api_headers(csrftoken)
+    keys = set()
+    page = 1
+    while True:
+        url = f"{BASE_URL}/api/tasks/?project={project_id}&page={page}&page_size=100"
+        res = session.get(url, headers=headers, timeout=120)
+        if res.status_code != 200:
+            break
+        batch = parse_results(res.json())
+        if not batch:
+            break
+        for task in batch:
+            d = task.get("data", {})
+            keys.add(pair_key(d.get("query", ""), d.get("code", "")))
+        if len(batch) < 100:
+            break
+        page += 1
+    return keys
 
 
 def upload_to_labelstudio():
-    if not USERNAME or not PASSWORD:
-        raise RuntimeError("Set LABEL_STUDIO_EMAIL and LABEL_STUDIO_PASSWORD before running upload.")
+    session, csrftoken = login_session()
+    headers = api_headers(csrftoken)
 
-    session = requests.Session()
+    if RECREATE:
+        old_id = load_project_id()
+        if old_id:
+            delete_project(session, csrftoken, old_id)
+        save_project_id("")
+        project_id = ensure_project(session, csrftoken)
+    else:
+        project_id = ensure_project(session, csrftoken)
 
-    # 🟢 Step 1 — Get CSRF
-    session.get(BASE_URL)
-    csrftoken = session.cookies.get("csrftoken")
-
-    # 🟢 Step 2 — Login
-    login_url = f"{BASE_URL}/user/login/"
-    headers = {"X-CSRFToken": csrftoken}
-
-    login_data = {
-        "email": USERNAME,
-        "password": PASSWORD
-    }
-
-    login_res = session.post(login_url, data=login_data, headers=headers)
-
-    print("LOGIN STATUS:", login_res.status_code)
-
-    if login_res.status_code != 200:
-        print("❌ Login failed")
-        return
-
-    # 🔥 STEP 3 — FAST RESET
-    PROJECT_ID = recreate_project(session, csrftoken)
-
-    # 🟢 Step 4 — Load dataset
     with open(INPUT, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # 🔥 LIMIT DATA
-    MAX_SAMPLES = 500
     data = data[:MAX_SAMPLES]
+    known = existing_task_keys(session, csrftoken, project_id)
 
-    print(f"🚀 Uploading {len(data)} samples")
+    tasks = []
+    for item in data:
+        query = item.get("query") or item.get("hard_query") or item.get("soft_query", "")
+        code = item.get("code", "")
+        if not query or not code:
+            continue
+        key = pair_key(query, code)
+        if key in known:
+            continue
+        tasks.append({"data": {"query": query, "code": code}})
 
-    # 🟢 Step 5 — Format tasks
-    tasks = [
-        {
-            "data": {
-                "query": item.get("query") or item.get("hard_query") or item.get("soft_query", ""),
-                "code": item.get("code", "")
-            }
-        }
-        for item in data
-    ]
+    if not tasks:
+        print("No new tasks to upload (project unchanged)")
+        return
 
-    # 🟢 Step 6 — Upload
-    url = f"{BASE_URL}/api/projects/{PROJECT_ID}/import"
+    print(f"Uploading {len(tasks)} new tasks to project {project_id}")
 
-    headers = {
-        "X-CSRFToken": csrftoken,
-        "Content-Type": "application/json"
-    }
+    url = f"{BASE_URL}/api/projects/{project_id}/import"
+    uploaded = 0
+    for start in range(0, len(tasks), IMPORT_BATCH):
+        chunk = tasks[start : start + IMPORT_BATCH]
+        res = session.post(url, json=chunk, headers=headers, timeout=120)
+        if res.status_code not in (200, 201):
+            raise RuntimeError(f"Upload failed: {res.status_code} {res.text[:300]}")
+        uploaded += len(chunk)
 
-    res = session.post(url, json=tasks, headers=headers)
-
-    print("\n====== RESULT ======")
-    print("UPLOAD STATUS:", res.status_code)
-    print("RESPONSE:", res.text[:300])
-    print("====================\n")
+    print(f"Uploaded {uploaded} tasks (total requested {len(tasks)})")
 
 
 if __name__ == "__main__":

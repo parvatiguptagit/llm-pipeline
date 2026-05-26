@@ -1,0 +1,10 @@
+gitpython
+datasets
+transformers
+sentence-transformers>=3.0.0
+accelerate>=1.1.0
+torch
+dvc
+requests
+python-dotenv
+einops

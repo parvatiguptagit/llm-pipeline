@@ -3,6 +3,7 @@ import json
 INPUT = "labelstudio_export.json"
 OUTPUT = "train.json"
 
+
 def convert():
     with open(INPUT, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -13,7 +14,6 @@ def convert():
         query = item.get("data", {}).get("query", "")
         code = item.get("data", {}).get("code", "")
 
-        # skip unlabeled
         if not item.get("annotations"):
             continue
 
@@ -27,16 +27,20 @@ def convert():
 
         label = 1 if label_raw == "Relevant" else 0
 
-        dataset.append({
-            "query": query,
-            "code": code,
-            "label": label
-        })
+        dataset.append(
+            {
+                "query": query,
+                "code": code,
+                "label": label,
+                "source": "human",
+            }
+        )
 
-    with open(OUTPUT, "w") as f:
+    with open(OUTPUT, "w", encoding="utf-8") as f:
         json.dump(dataset, f, indent=2)
 
-    print(f"✅ Converted {len(dataset)} samples")
+    print(f"Converted {len(dataset)} human-labeled samples")
+
 
 if __name__ == "__main__":
     convert()

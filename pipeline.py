@@ -2,11 +2,11 @@ import subprocess
 import sys
 
 def run(step, cmd):
-    print(f"\n🚀 {step}")
+    print(f"\n== {step} ==")
     result = subprocess.run(cmd, shell=True)
 
     if result.returncode != 0:
-        raise Exception(f"❌ Failed at {step}")
+        raise Exception(f"Failed at {step}")
 
 def main():
     py = f"\"{sys.executable}\""
@@ -20,7 +20,7 @@ def main():
 
     run("Upload to Label Studio", f"{py} scripts/upload_labelstudio.py")
 
-    print("\n✅ FULL PIPELINE COMPLETE")
+    print("\nFULL PIPELINE COMPLETE")
 
 if __name__ == "__main__":
     main()

@@ -11,7 +11,7 @@ def main():
     ds = Dataset.from_list(data)
     ds.save_to_disk(OUTPUT)
 
-    print("✅ Dataset created")
+    print("Dataset created")
 
 if __name__ == "__main__":
     main()
