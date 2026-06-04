@@ -1,0 +1,176 @@
+[
+  {
+    "query": "Where is the function that main entry point for PR overlap detection?",
+    "code": "def main():\n    \"\"\"Main entry point for PR overlap detection.\"\"\"\n    import argparse\n\n    parser = argparse.ArgumentParser(description=\"Detect PR overlaps and potential merge conflicts\")\n    parser.add_argument(\"pr_number\", type=int, help=\"PR number to check\")\n    parser.add_argument(\"--base\", default=None, help=\"Base branch (default: auto-detect from PR)\")\n    parser.add_argument(\"--skip-merge-test\", action=\"store_true\", help=\"Skip actual merge conflict testing\")\n    parser.add_argument(\"--discord-webhook\", default=os.environ.get(\"DISCORD_WEBHOOK_URL\"), help=\"Discord webhook URL for notifications\")\n    parser.add_argument(\"--dry-run\", action=\"store_true\", help=\"Don't post comments, just print\")\n\n    args = parser.parse_args()\n\n    owner, repo = get_repo_info()\n    print(f\"Checking PR #{args.pr_number} in {owner}/{repo}\")\n\n    # Get current PR info\n    current_pr = fetch_pr_details(args.pr_number)\n    base_branch = args.base or current_pr.base_ref\n\n    print(f\"PR #{current_pr.number}: {current_pr.title}\")\n    print(f\"Base branch: {base_branch}\")\n    print(f\"Files changed: {len(current_pr.files)}\")\n\n    # Find overlapping PRs\n    overlaps, all_changes = find_overlapping_prs(\n        owner, repo, base_branch, current_pr, args.pr_number, args.skip_merge_test\n    )\n\n    if not overlaps:\n        print(\"No overlaps detected!\")\n        return\n\n    # Generate and post report\n    comment = format_comment(overlaps, args.pr_number, current_pr.changed_ranges, all_changes)\n\n    if args.dry_run:\n        print(\"\\n\" + \"=\"*60)\n        print(\"COMMENT PREVIEW:\")\n        print(\"=\"*60)\n        print(comment)\n    else:\n        if comment:\n            post_or_update_comment(args.pr_number, comment)\n            print(\"Posted comment to PR\")\n\n        if args.discord_webhook:\n            send_discord_notification(args.discord_webhook, current_pr, overlaps)\n\n    # Report results and exit\n    report_results(overlaps)",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that fetch details for a specific PR including its diff?",
+    "code": "def fetch_pr_details(pr_number: int) -> \"PullRequest\":\n    \"\"\"Fetch details for a specific PR including its diff.\"\"\"\n    result = run_gh([\"pr\", \"view\", str(pr_number), \"--json\", \"number,title,url,author,headRefName,baseRefName,files\"])\n    data = json.loads(result.stdout)\n\n    pr = PullRequest(\n        number=data[\"number\"],\n        title=data[\"title\"],\n        author=data[\"author\"][\"login\"] if data.get(\"author\") else \"unknown\",\n        url=data[\"url\"],\n        head_ref=data[\"headRefName\"],\n        base_ref=data[\"baseRefName\"],\n        files=[f[\"path\"] for f in data[\"files\"]],\n        changed_ranges={}\n    )\n\n    # Get detailed diff\n    diff = get_pr_diff(pr_number)\n    pr.changed_ranges = parse_diff_ranges(diff)\n\n    return pr",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that find all PRs that overlap with the current PR?",
+    "code": "def find_overlapping_prs(\n    owner: str,\n    repo: str,\n    base_branch: str,\n    current_pr: \"PullRequest\",\n    current_pr_number: int,\n    skip_merge_test: bool\n) -> tuple[list[\"Overlap\"], dict[int, dict[str, \"ChangedFile\"]]]:\n    \"\"\"Find all PRs that overlap with the current PR.\"\"\"\n    # Query other open PRs\n    all_prs = query_open_prs(owner, repo, base_branch)\n    other_prs = [p for p in all_prs if p[\"number\"] != current_pr_number]\n\n    print(f\"Found {len(other_prs)} other open PRs targeting {base_branch}\")\n\n    # Find file overlaps (excluding ignored files, filtering by age)\n    candidates = find_file_overlap_candidates(current_pr.files, other_prs)\n\n    print(f\"Found {len(candidates)} PRs with file overlap (excluding ignored files)\")\n\n    if not candidates:\n        return [], {}\n\n    # First pass: analyze line overlaps (no merge testing yet)\n    overlaps = []\n    all_changes = {}\n    prs_needing_merge_test = []\n\n    for pr_data, shared_files in candidates:\n        overlap, pr_changes = analyze_pr_overlap(\n            owner, repo, base_branch, current_pr, pr_data, shared_files,\n            skip_merge_test=True  # Always skip in first pass\n        )\n        if overlap:\n            overlaps.append(overlap)\n            all_changes[pr_data[\"number\"]] = pr_changes\n            # Track PRs that need merge testing\n            if overlap.line_overlaps and not skip_merge_test:\n                prs_needing_merge_test.append(overlap)\n\n    # Second pass: batch merge testing with shared clone\n    if prs_needing_merge_test:\n        run_batch_merge_tests(owner, repo, base_branch, current_pr, prs_needing_merge_test)\n\n    return overlaps, all_changes",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that run merge tests for multiple PRs using a shared clone?",
+    "code": "def run_batch_merge_tests(\n    owner: str,\n    repo: str,\n    base_branch: str,\n    current_pr: \"PullRequest\",\n    overlaps: list[\"Overlap\"]\n):\n    \"\"\"Run merge tests for multiple PRs using a shared clone.\"\"\"\n    with tempfile.TemporaryDirectory() as tmpdir:\n        # Clone once\n        if not clone_repo(owner, repo, base_branch, tmpdir):\n            return\n\n        configure_git(tmpdir)\n\n        # Fetch current PR branch once\n        result = run_git([\"fetch\", \"origin\", f\"pull/{current_pr.number}/head:pr-{current_pr.number}\"], cwd=tmpdir, check=False)\n        if result.returncode != 0:\n            print(f\"Warning: Could not fetch current PR #{current_pr.number}\", file=sys.stderr)\n            return\n\n        for overlap in overlaps:\n            other_pr = overlap.pr_b if overlap.pr_a.number == current_pr.number else overlap.pr_a\n            print(f\"Testing merge conflict with PR #{other_pr.number}...\", flush=True)\n\n            # Clean up any in-progress merge from previous iteration\n            run_git([\"merge\", \"--abort\"], cwd=tmpdir, check=False)\n\n            # Reset to base branch\n            run_git([\"checkout\", base_branch], cwd=tmpdir, check=False)\n            run_git([\"reset\", \"--hard\", f\"origin/{base_branch}\"], cwd=tmpdir, check=False)\n            run_git([\"clean\", \"-fdx\"], cwd=tmpdir, check=False)\n\n            # Fetch the other PR branch\n            result = run_git([\"fetch\", \"origin\", f\"pull/{other_pr.number}/head:pr-{other_pr.number}\"], cwd=tmpdir, check=False)\n            if result.returncode != 0:\n                print(f\"Warning: Could not fetch PR #{other_pr.number}: {result.stderr.strip()}\", file=sys.stderr)\n                continue\n\n            # Try merging current PR first\n            result = run_git([\"merge\", \"--no-commit\", \"--no-ff\", f\"pr-{current_pr.number}\"], cwd=tmpdir, check=False)\n            if result.returncode != 0:\n                # Current PR conflicts with base\n                conflict_files, conflict_details = extract_conflict_info(tmpdir, result.stderr)\n                overlap.has_merge_conflict = True\n                overlap.conflict_files = conflict_files\n                overlap.conflict_details = conflict_details\n                overlap.conflict_type = 'pr_a_conflicts_base'\n                run_git([\"merge\", \"--abort\"], cwd=tmpdir, check=False)\n                continue\n\n            # Commit and try merging other PR\n            run_git([\"commit\", \"-m\", f\"Merge PR #{current_pr.number}\"], cwd=tmpdir, check=False)\n\n            result = run_git([\"merge\", \"--no-commit\", \"--no-ff\", f\"pr-{other_pr.number}\"], cwd=tmpdir, check=False)\n            if result.returncode != 0:\n                # Conflict between PRs\n                conflict_files, conflict_details = extract_conflict_info(tmpdir, result.stderr)\n                overlap.has_merge_conflict = True\n                overlap.conflict_files = conflict_files\n                overlap.conflict_details = conflict_details\n                overlap.conflict_type = 'conflict'\n                run_git([\"merge\", \"--abort\"], cwd=tmpdir, check=False)",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that analyze overlap between current PR and another PR?",
+    "code": "def analyze_pr_overlap(\n    owner: str,\n    repo: str,\n    base_branch: str,\n    current_pr: \"PullRequest\",\n    other_pr_data: dict,\n    shared_files: list[str],\n    skip_merge_test: bool\n) -> tuple[Optional[\"Overlap\"], dict[str, \"ChangedFile\"]]:\n    \"\"\"Analyze overlap between current PR and another PR.\"\"\"\n    # Filter out ignored files\n    non_ignored_shared = [f for f in shared_files if not should_ignore_file(f)]\n    if not non_ignored_shared:\n        return None, {}\n\n    other_pr = PullRequest(\n        number=other_pr_data[\"number\"],\n        title=other_pr_data[\"title\"],\n        author=other_pr_data[\"author\"],\n        url=other_pr_data[\"url\"],\n        head_ref=other_pr_data[\"head_ref\"],\n        base_ref=other_pr_data[\"base_ref\"],\n        files=other_pr_data[\"files\"],\n        changed_ranges={},\n        updated_at=other_pr_data.get(\"updated_at\")\n    )\n\n    # Get diff for other PR\n    other_diff = get_pr_diff(other_pr.number)\n    other_pr.changed_ranges = parse_diff_ranges(other_diff)\n\n    # Check line overlaps\n    line_overlaps = find_line_overlaps(\n        current_pr.changed_ranges,\n        other_pr.changed_ranges,\n        shared_files\n    )\n\n    overlap = Overlap(\n        pr_a=current_pr,\n        pr_b=other_pr,\n        overlapping_files=non_ignored_shared,\n        line_overlaps=line_overlaps\n    )\n\n    # Test for actual merge conflicts if we have line overlaps\n    if line_overlaps and not skip_merge_test:\n        print(f\"Testing merge conflict with PR #{other_pr.number}...\", flush=True)\n        has_conflict, conflict_files, conflict_details, error_type = test_merge_conflict(\n            owner, repo, base_branch, current_pr, other_pr\n        )\n        overlap.has_merge_conflict = has_conflict\n        overlap.conflict_files = conflict_files\n        overlap.conflict_details = conflict_details\n        overlap.conflict_type = error_type\n\n    return overlap, other_pr.changed_ranges",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that find PRs that share files with the current PR?",
+    "code": "def find_file_overlap_candidates(\n    current_files: list[str],\n    other_prs: list[dict],\n    max_age_days: int = 14\n) -> list[tuple[dict, list[str]]]:\n    \"\"\"Find PRs that share files with the current PR.\"\"\"\n    from datetime import datetime, timezone, timedelta\n\n    current_files_set = set(f for f in current_files if not should_ignore_file(f))\n    candidates = []\n    cutoff_date = datetime.now(timezone.utc) - timedelta(days=max_age_days)\n\n    for pr_data in other_prs:\n        # Filter out PRs older than max_age_days\n        updated_at = pr_data.get(\"updated_at\")\n        if updated_at:\n            try:\n                pr_date = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))\n                if pr_date < cutoff_date:\n                    continue  # Skip old PRs\n            except Exception as e:\n                # If we can't parse date, include the PR (safe fallback)\n                print(f\"Warning: Could not parse date for PR: {e}\", file=sys.stderr)\n\n        other_files = set(f for f in pr_data[\"files\"] if not should_ignore_file(f))\n        shared = current_files_set & other_files\n\n        if shared:\n            candidates.append((pr_data, list(shared)))\n\n    return candidates",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that report results (informational only, always exits 0)?",
+    "code": "def report_results(overlaps: list[\"Overlap\"]):\n    \"\"\"Report results (informational only, always exits 0).\"\"\"\n    conflicts = [o for o in overlaps if o.has_merge_conflict]\n    if conflicts:\n        print(f\"\\n\u26a0\ufe0f  Found {len(conflicts)} merge conflict(s)\")\n\n    line_overlap_count = len([o for o in overlaps if o.line_overlaps])\n    if line_overlap_count:\n        print(f\"\\n\u26a0\ufe0f  Found {line_overlap_count} PR(s) with line overlap\")\n\n    print(\"\\n\u2705 Done\")\n    # Always exit 0 - this check is informational, not a merge blocker",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that format the overlap report as a PR comment?",
+    "code": "def format_comment(\n    overlaps: list[\"Overlap\"],\n    current_pr: int,\n    changes_current: dict[str, \"ChangedFile\"],\n    all_changes: dict[int, dict[str, \"ChangedFile\"]]\n) -> str:\n    \"\"\"Format the overlap report as a PR comment.\"\"\"\n    if not overlaps:\n        return \"\"\n\n    lines = [\"## \ud83d\udd0d PR Overlap Detection\"]\n    lines.append(\"\")\n    lines.append(\"This check compares your PR against all other open PRs targeting the same branch to detect potential merge conflicts early.\")\n    lines.append(\"\")\n\n    # Check if current PR conflicts with base branch\n    format_base_conflicts(overlaps, lines)\n\n    # Classify and sort overlaps\n    classified = classify_all_overlaps(overlaps, current_pr, changes_current, all_changes)\n\n    # Group by risk\n    conflicts = [(o, r) for o, r in classified if r == 'conflict']\n    medium_risk = [(o, r) for o, r in classified if r == 'medium']\n    low_risk = [(o, r) for o, r in classified if r == 'low']\n\n    # Format each section\n    format_conflicts_section(conflicts, current_pr, lines)\n    format_medium_risk_section(medium_risk, current_pr, changes_current, all_changes, lines)\n    format_low_risk_section(low_risk, current_pr, lines)\n\n    # Summary\n    total = len(overlaps)\n    lines.append(f\"\\n**Summary:** {len(conflicts)} conflict(s), {len(medium_risk)} medium risk, {len(low_risk)} low risk (out of {total} PRs with file overlap)\")\n    lines.append(\"\\n---\\n*Auto-generated on push. Ignores: `openapi.json`, lock files.*\")\n\n    return \"\\n\".join(lines)",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that format base branch conflicts section?",
+    "code": "def format_base_conflicts(overlaps: list[\"Overlap\"], lines: list[str]):\n    \"\"\"Format base branch conflicts section.\"\"\"\n    base_conflicts = [o for o in overlaps if o.conflict_type == 'pr_a_conflicts_base']\n    if base_conflicts:\n        lines.append(\"### \u26a0\ufe0f This PR has conflicts with the base branch\\n\")\n        lines.append(\"Conflicts will need to be resolved before merging:\\n\")\n        first = base_conflicts[0]\n        for f in first.conflict_files[:10]:\n            lines.append(f\"- `{f}`\")\n        if len(first.conflict_files) > 10:\n            lines.append(f\"- ... and {len(first.conflict_files) - 10} more files\")\n        lines.append(\"\\n\")",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that format the merge conflicts section?",
+    "code": "def format_conflicts_section(conflicts: list[tuple], current_pr: int, lines: list[str]):\n    \"\"\"Format the merge conflicts section.\"\"\"\n    pr_conflicts = [(o, r) for o, r in conflicts if o.conflict_type != 'pr_a_conflicts_base']\n\n    if not pr_conflicts:\n        return\n\n    lines.append(\"### \ud83d\udd34 Merge Conflicts Detected\")\n    lines.append(\"\")\n    lines.append(\"The following PRs have been tested and **will have merge conflicts** if merged after this PR. Consider coordinating with the authors.\")\n    lines.append(\"\")\n\n    for o, _ in pr_conflicts:\n        other = o.pr_b if o.pr_a.number == current_pr else o.pr_a\n        format_pr_entry(other, lines)\n        format_conflict_details(o, lines)\n        lines.append(\"\")",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that format the medium risk section?",
+    "code": "def format_medium_risk_section(\n    medium_risk: list[tuple],\n    current_pr: int,\n    changes_current: dict,\n    all_changes: dict,\n    lines: list[str]\n):\n    \"\"\"Format the medium risk section.\"\"\"\n    if not medium_risk:\n        return\n\n    lines.append(\"### \ud83d\udfe1 Medium Risk \u2014 Some Line Overlap\\n\")\n    lines.append(\"These PRs have some overlapping changes:\\n\")\n\n    for o, _ in medium_risk:\n        other = o.pr_b if o.pr_a.number == current_pr else o.pr_a\n        other_changes = all_changes.get(other.number, {})\n        format_pr_entry(other, lines)\n\n        # Note if rename is involved\n        for file_path in o.overlapping_files:\n            file_a = changes_current.get(file_path)\n            file_b = other_changes.get(file_path)\n            if (file_a and file_a.is_rename) or (file_b and file_b.is_rename):\n                lines.append(f\"  - \u26a0\ufe0f `{file_path}` is being renamed/moved\")\n                break\n\n        if o.line_overlaps:\n            for file_path, ranges in o.line_overlaps.items():\n                range_strs = [f\"L{r[0]}-{r[1]}\" if r[0] != r[1] else f\"L{r[0]}\" for r in ranges]\n                lines.append(f\"  - `{file_path}`: {', '.join(range_strs)}\")\n        else:\n            non_ignored = [f for f in o.overlapping_files if not should_ignore_file(f)]\n            if non_ignored:\n                lines.append(f\"  - Shared files: `{'`, `'.join(non_ignored[:5])}`\")\n        lines.append(\"\")",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that format the low risk section?",
+    "code": "def format_low_risk_section(low_risk: list[tuple], current_pr: int, lines: list[str]):\n    \"\"\"Format the low risk section.\"\"\"\n    if not low_risk:\n        return\n\n    lines.append(\"### \ud83d\udfe2 Low Risk \u2014 File Overlap Only\\n\")\n    lines.append(\"<details><summary>These PRs touch the same files but different sections (click to expand)</summary>\\n\")\n\n    for o, _ in low_risk:\n        other = o.pr_b if o.pr_a.number == current_pr else o.pr_a\n        non_ignored = [f for f in o.overlapping_files if not should_ignore_file(f)]\n        if non_ignored:\n            format_pr_entry(other, lines)\n            if o.line_overlaps:\n                for file_path, ranges in o.line_overlaps.items():\n                    range_strs = [f\"L{r[0]}-{r[1]}\" if r[0] != r[1] else f\"L{r[0]}\" for r in ranges]\n                    lines.append(f\"  - `{file_path}`: {', '.join(range_strs)}\")\n            else:\n                lines.append(f\"  - Shared files: `{'`, `'.join(non_ignored[:5])}`\")\n            lines.append(\"\")  # Add blank line between entries\n\n    lines.append(\"</details>\\n\")",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that format conflict size string for a file?",
+    "code": "def format_conflict_size(detail: \"ConflictInfo\") -> str:\n    \"\"\"Format conflict size string for a file.\"\"\"\n    if detail.conflict_count > 0:\n        return f\" ({detail.conflict_count} conflict{'s' if detail.conflict_count > 1 else ''}, ~{detail.conflict_lines} lines)\"\n    elif detail.conflict_type != 'content':\n        type_labels = {\n            'both_added': 'added in both',\n            'both_deleted': 'deleted in both',\n            'deleted_by_us': 'deleted here, modified there',\n            'deleted_by_them': 'modified here, deleted there',\n            'added_by_us': 'added here',\n            'added_by_them': 'added there',\n        }\n        label = type_labels.get(detail.conflict_type, detail.conflict_type)\n        return f\" ({label})\"\n    return \"\"",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that format line overlap details?",
+    "code": "def format_line_overlaps(line_overlaps: dict[str, list[tuple]], lines: list[str]):\n    \"\"\"Format line overlap details.\"\"\"\n    all_paths = list(line_overlaps.keys())\n    common_prefix = find_common_prefix(all_paths) if len(all_paths) > 1 else \"\"\n    if common_prefix:\n        lines.append(f\"  - \ud83d\udcc1 `{common_prefix}`\")\n    for file_path, ranges in line_overlaps.items():\n        display_path = file_path[len(common_prefix):] if common_prefix else file_path\n        range_strs = [f\"L{r[0]}-{r[1]}\" if r[0] != r[1] else f\"L{r[0]}\" for r in ranges]\n        indent = \"    \" if common_prefix else \"  \"\n        lines.append(f\"{indent}- `{display_path}`: {', '.join(range_strs)}\")",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that classify all overlaps by risk level and sort them?",
+    "code": "def classify_all_overlaps(\n    overlaps: list[\"Overlap\"],\n    current_pr: int,\n    changes_current: dict,\n    all_changes: dict\n) -> list[tuple[\"Overlap\", str]]:\n    \"\"\"Classify all overlaps by risk level and sort them.\"\"\"\n    classified = []\n    for o in overlaps:\n        other_pr = o.pr_b if o.pr_a.number == current_pr else o.pr_a\n        other_changes = all_changes.get(other_pr.number, {})\n        risk = classify_overlap_risk(o, changes_current, other_changes)\n        classified.append((o, risk))\n\n    def sort_key(item):\n        o, risk = item\n        risk_order = {'conflict': 0, 'medium': 1, 'low': 2}\n        # For conflicts, also sort by total conflict lines (descending)\n        conflict_lines = sum(d.conflict_lines for d in o.conflict_details) if o.conflict_details else 0\n        return (risk_order.get(risk, 99), -conflict_lines)\n\n    classified.sort(key=sort_key)\n\n    return classified",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that classify the risk level of an overlap?",
+    "code": "def classify_overlap_risk(\n    overlap: \"Overlap\",\n    changes_a: dict[str, \"ChangedFile\"],\n    changes_b: dict[str, \"ChangedFile\"]\n) -> str:\n    \"\"\"Classify the risk level of an overlap.\"\"\"\n    if overlap.has_merge_conflict:\n        return 'conflict'\n\n    has_rename = any(\n        (changes_a.get(f) and changes_a[f].is_rename) or\n        (changes_b.get(f) and changes_b[f].is_rename)\n        for f in overlap.overlapping_files\n    )\n\n    if overlap.line_overlaps:\n        total_overlap_lines = sum(\n            end - start + 1\n            for ranges in overlap.line_overlaps.values()\n            for start, end in ranges\n        )\n\n        # Medium risk: >20 lines overlap or file rename\n        if total_overlap_lines > 20 or has_rename:\n            return 'medium'\n        else:\n            return 'low'\n\n    if has_rename:\n        return 'medium'\n\n    return 'low'",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that find overlapping line ranges in shared files?",
+    "code": "def find_line_overlaps(\n    changes_a: dict[str, \"ChangedFile\"],\n    changes_b: dict[str, \"ChangedFile\"],\n    shared_files: list[str]\n) -> dict[str, list[tuple[int, int]]]:\n    \"\"\"Find overlapping line ranges in shared files.\"\"\"\n    overlaps = {}\n\n    for file_path in shared_files:\n        if should_ignore_file(file_path):\n            continue\n\n        file_a = changes_a.get(file_path)\n        file_b = changes_b.get(file_path)\n\n        if not file_a or not file_b:\n            continue\n\n        # Skip pure renames\n        if file_a.is_rename and not file_a.additions and not file_a.deletions:\n            continue\n        if file_b.is_rename and not file_b.additions and not file_b.deletions:\n            continue\n\n        # Note: This mixes old-file (deletions) and new-file (additions) line numbers,\n        # which can cause false positives when PRs insert/remove many lines.\n        # Acceptable for v1 since the real merge test is the authoritative check.\n        file_overlaps = find_range_overlaps(\n            file_a.additions + file_a.deletions,\n            file_b.additions + file_b.deletions\n        )\n\n        if file_overlaps:\n            overlaps[file_path] = merge_ranges(file_overlaps)\n\n    return overlaps",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that find overlapping regions between two sets of ranges?",
+    "code": "def find_range_overlaps(\n    ranges_a: list[tuple[int, int]],\n    ranges_b: list[tuple[int, int]]\n) -> list[tuple[int, int]]:\n    \"\"\"Find overlapping regions between two sets of ranges.\"\"\"\n    overlaps = []\n    for range_a in ranges_a:\n        for range_b in ranges_b:\n            if ranges_overlap(range_a, range_b):\n                overlap_start = max(range_a[0], range_b[0])\n                overlap_end = min(range_a[1], range_b[1])\n                overlaps.append((overlap_start, overlap_end))\n    return overlaps",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that check if two line ranges overlap?",
+    "code": "def ranges_overlap(range_a: tuple[int, int], range_b: tuple[int, int]) -> bool:\n    \"\"\"Check if two line ranges overlap.\"\"\"\n    return range_a[0] <= range_b[1] and range_b[0] <= range_a[1]",
+    "label": 0,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that merge overlapping line ranges?",
+    "code": "def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:\n    \"\"\"Merge overlapping line ranges.\"\"\"\n    if not ranges:\n        return []\n\n    sorted_ranges = sorted(ranges, key=lambda x: x[0])\n    merged = [sorted_ranges[0]]\n\n    for current in sorted_ranges[1:]:\n        last = merged[-1]\n        if current[0] <= last[1] + 1:\n            merged[-1] = (last[0], max(last[1], current[1]))\n        else:\n            merged.append(current)\n\n    return merged",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that test if merging both PRs would cause a conflict?",
+    "code": "def test_merge_conflict(\n    owner: str,\n    repo: str,\n    base_branch: str,\n    pr_a: \"PullRequest\",\n    pr_b: \"PullRequest\"\n) -> tuple[bool, list[str], list[\"ConflictInfo\"], str]:\n    \"\"\"Test if merging both PRs would cause a conflict.\"\"\"\n    with tempfile.TemporaryDirectory() as tmpdir:\n        # Clone repo\n        if not clone_repo(owner, repo, base_branch, tmpdir):\n            return False, [], [], None\n\n        configure_git(tmpdir)\n        if not fetch_pr_branches(tmpdir, pr_a.number, pr_b.number):\n            # Fetch failed for one or both PRs - can't test merge\n            return False, [], [], None\n\n        # Try merging PR A first\n        conflict_result = try_merge_pr(tmpdir, pr_a.number)\n        if conflict_result:\n            return True, conflict_result[0], conflict_result[1], 'pr_a_conflicts_base'\n\n        # Commit and try merging PR B\n        run_git([\"commit\", \"-m\", f\"Merge PR #{pr_a.number}\"], cwd=tmpdir, check=False)\n\n        conflict_result = try_merge_pr(tmpdir, pr_b.number)\n        if conflict_result:\n            return True, conflict_result[0], conflict_result[1], 'conflict'\n\n        return False, [], [], None",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that clone the repository?",
+    "code": "def clone_repo(owner: str, repo: str, branch: str, tmpdir: str) -> bool:\n    \"\"\"Clone the repository.\"\"\"\n    clone_url = f\"https://github.com/{owner}/{repo}.git\"\n    result = run_git(\n        [\"clone\", \"--depth=50\", \"--branch\", branch, clone_url, tmpdir],\n        check=False\n    )\n    if result.returncode != 0:\n        print(f\"Failed to clone: {result.stderr}\", file=sys.stderr)\n        return False\n    return True",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that configure git for commits?",
+    "code": "def configure_git(tmpdir: str):\n    \"\"\"Configure git for commits.\"\"\"\n    run_git([\"config\", \"user.email\", \"github-actions[bot]@users.noreply.github.com\"], cwd=tmpdir, check=False)\n    run_git([\"config\", \"user.name\", \"github-actions[bot]\"], cwd=tmpdir, check=False)",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that fetch both PR branches. Returns False if any fetch fails?",
+    "code": "def fetch_pr_branches(tmpdir: str, pr_a: int, pr_b: int) -> bool:\n    \"\"\"Fetch both PR branches. Returns False if any fetch fails.\"\"\"\n    success = True\n    for pr_num in (pr_a, pr_b):\n        result = run_git([\"fetch\", \"origin\", f\"pull/{pr_num}/head:pr-{pr_num}\"], cwd=tmpdir, check=False)\n        if result.returncode != 0:\n            print(f\"Warning: Could not fetch PR #{pr_num}: {result.stderr.strip()}\", file=sys.stderr)\n            success = False\n    return success",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that try to merge a PR. Returns conflict info if conflicts, None if success?",
+    "code": "def try_merge_pr(tmpdir: str, pr_number: int) -> Optional[tuple[list[str], list[\"ConflictInfo\"]]]:\n    \"\"\"Try to merge a PR. Returns conflict info if conflicts, None if success.\"\"\"\n    result = run_git([\"merge\", \"--no-commit\", \"--no-ff\", f\"pr-{pr_number}\"], cwd=tmpdir, check=False)\n\n    if result.returncode == 0:\n        return None\n\n    # Conflict detected\n    conflict_files, conflict_details = extract_conflict_info(tmpdir, result.stderr)\n    run_git([\"merge\", \"--abort\"], cwd=tmpdir, check=False)\n\n    return conflict_files, conflict_details",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that extract conflict information from git status?",
+    "code": "def extract_conflict_info(tmpdir: str, stderr: str) -> tuple[list[str], list[\"ConflictInfo\"]]:\n    \"\"\"Extract conflict information from git status.\"\"\"\n    status_result = run_git([\"status\", \"--porcelain\"], cwd=tmpdir, check=False)\n\n    status_types = {\n        'UU': 'content',\n        'AA': 'both_added',\n        'DD': 'both_deleted',\n        'DU': 'deleted_by_us',\n        'UD': 'deleted_by_them',\n        'AU': 'added_by_us',\n        'UA': 'added_by_them',\n    }\n\n    conflict_files = []\n    conflict_details = []\n\n    for line in status_result.stdout.split(\"\\n\"):\n        if len(line) >= 3 and line[0:2] in status_types:\n            status_code = line[0:2]\n            file_path = line[3:].strip()\n            conflict_files.append(file_path)\n\n            info = analyze_conflict_markers(file_path, tmpdir)\n            info.conflict_type = status_types.get(status_code, 'unknown')\n            conflict_details.append(info)\n\n    # Fallback to stderr parsing\n    if not conflict_files and stderr:\n        for line in stderr.split(\"\\n\"):\n            if \"CONFLICT\" in line and \":\" in line:\n                parts = line.split(\":\")\n                if len(parts) > 1:\n                    file_part = parts[-1].strip()\n                    if file_part and not file_part.startswith(\"Merge\"):\n                        conflict_files.append(file_part)\n                        conflict_details.append(ConflictInfo(path=file_part))\n\n    return conflict_files, conflict_details",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that analyze a conflicted file to count conflict regions and lines?",
+    "code": "def analyze_conflict_markers(file_path: str, cwd: str) -> \"ConflictInfo\":\n    \"\"\"Analyze a conflicted file to count conflict regions and lines.\"\"\"\n    info = ConflictInfo(path=file_path)\n\n    try:\n        full_path = os.path.join(cwd, file_path)\n        with open(full_path, 'r', errors='ignore') as f:\n            content = f.read()\n\n        in_conflict = False\n        current_conflict_lines = 0\n\n        for line in content.split('\\n'):\n            if line.startswith('<<<<<<<'):\n                in_conflict = True\n                info.conflict_count += 1\n                current_conflict_lines = 1\n            elif line.startswith('>>>>>>>'):\n                in_conflict = False\n                current_conflict_lines += 1\n                info.conflict_lines += current_conflict_lines\n            elif in_conflict:\n                current_conflict_lines += 1\n    except Exception as e:\n        print(f\"Warning: Could not analyze conflict markers in {file_path}: {e}\", file=sys.stderr)\n\n    return info",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that parse a unified diff and extract changed line ranges per file?",
+    "code": "def parse_diff_ranges(diff: str) -> dict[str, \"ChangedFile\"]:\n    \"\"\"Parse a unified diff and extract changed line ranges per file.\"\"\"\n    files = {}\n    current_file = None\n    pending_rename_from = None\n    is_rename = False\n\n    for line in diff.split(\"\\n\"):\n        # Reset rename state on new file diff header\n        if line.startswith(\"diff --git \"):\n            is_rename = False\n            pending_rename_from = None\n        elif line.startswith(\"rename from \"):\n            pending_rename_from = line[12:]\n            is_rename = True\n        elif line.startswith(\"rename to \"):\n            pass  # rename target is captured via \"+++ b/\" line\n        elif line.startswith(\"similarity index\"):\n            is_rename = True\n        elif line.startswith(\"+++ b/\"):\n            path = line[6:]\n            current_file = ChangedFile(\n                path=path,\n                additions=[],\n                deletions=[],\n                is_rename=is_rename,\n                old_path=pending_rename_from\n            )\n            files[path] = current_file\n            pending_rename_from = None\n            is_rename = False\n        elif line.startswith(\"--- /dev/null\"):\n            is_rename = False\n            pending_rename_from = None\n        elif line.startswith(\"@@\") and current_file:\n            parse_hunk_header(line, current_file)\n\n    return files",
+    "label": 1,
+    "source": "human"
+  },
+  {
+    "query": "Where is the function that parse a diff hunk header and add ranges to the file?",
+    "code": "def parse_hunk_header(line: str, current_file: \"ChangedFile\"):\n    \"\"\"Parse a diff hunk header and add ranges to the file.\"\"\"\n    match = re.match(r\"@@ -(\\d+)(?:,(\\d+))? \\+(\\d+)(?:,(\\d+))? @@\", line)\n    if match:\n        old_start = int(match.group(1))\n        old_count = int(match.group(2) or 1)\n        new_start = int(match.group(3))\n        new_count = int(match.group(4) or 1)\n\n        if old_count > 0:\n            current_file.deletions.append((old_start, old_start + old_count - 1))\n        if new_count > 0:\n            current_file.additions.append((new_start, new_start + new_count - 1))",
+    "label": 1,
+    "source": "human"
+  }
+]

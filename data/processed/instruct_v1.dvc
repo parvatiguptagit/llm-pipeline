@@ -1,0 +1,6 @@
+outs:
+- md5: 9dcd2e7690a0b4384fbafdfe0cb45f96.dir
+  size: 10185131
+  nfiles: 3
+  hash: md5
+  path: instruct_v1

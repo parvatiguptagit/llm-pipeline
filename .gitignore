@@ -13,9 +13,8 @@ __pycache__/
 # Models
 models/
 
-# Data
+# Data (actual files ignored by DVC-generated .gitignore; only .dvc pointers are tracked)
 data/raw/
-data/processed/
 
 # Label Studio exports
 exports/
@@ -29,3 +28,6 @@ exports/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Binaries
+ngrok.exe

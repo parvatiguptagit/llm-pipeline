@@ -8,10 +8,11 @@ def main():
     if os.path.exists(CLONE_DIR):
         print("Updating repo...")
         repo = Repo(CLONE_DIR)
-        repo.remotes.origin.pull()
+        repo.remotes.origin.fetch(depth=1)
+        repo.git.reset("--hard", "origin/HEAD")
     else:
         print("Cloning repo...")
-        Repo.clone_from(REPO_URL, CLONE_DIR)
+        Repo.clone_from(REPO_URL, CLONE_DIR, depth=1)
 
     print("Repo ready")
 
